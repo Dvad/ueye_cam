@@ -16,6 +16,7 @@
   <depend package="driver_base" />
   <depend package="sensor_msgs"/>
   <depend package="image_transport"/>
+  <depend package="cv_bridge"/>
   <depend package="camera_calibration_parsers" />
 </package>
 

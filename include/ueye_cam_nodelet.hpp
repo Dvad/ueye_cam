@@ -58,7 +58,7 @@
 #include <ueye_cam/UEyeCamConfig.h>
 #include <boost/thread/mutex.hpp>
 #include <ueye_cam_driver.hpp>
-
+#include <cv_bridge/cv_bridge.h>
 
 namespace ueye_cam {
 
@@ -165,6 +165,22 @@ protected:
   std::string cam_intr_filename_;
   std::string cam_params_filename_; // should be valid UEye INI file
   ueye_cam::UEyeCamConfig cam_params_;
+
+  //Rectification Stuff
+  std::string cfg_file;
+  double inputCalibration[5];
+  double outputCalibration[5];
+  int out_width, out_height;
+  int in_width, in_height;
+  bool doRect;
+  float* remapX;
+  float* remapY;
+  float rectClockAvg;
+  float frameClockAvg;
+  float averageMSPerFrame;
+  double lastRosTime;
+  clock_t last_clock;
+  void initRectification();
 };
 
 

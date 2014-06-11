@@ -52,7 +52,8 @@
 #include <camera_calibration_parsers/parse_ini.h>
 #include <sensor_msgs/fill_image.h>
 #include <sensor_msgs/image_encodings.h>
-
+#include <cv_bridge/cv_bridge.h>
+#include <fstream>
 
 //#define DEBUG_PRINTOUT_FRAME_GRAB_RATES
 
@@ -66,11 +67,11 @@ namespace ueye_cam {
 
 const string UEyeCamNodelet::DEFAULT_CAMERA_NAME = "camera";
 const string UEyeCamNodelet::DEFAULT_CAMERA_TOPIC = "image_raw";
-const int UEyeCamNodelet::DEFAULT_IMAGE_WIDTH = 640;
+const int UEyeCamNodelet::DEFAULT_IMAGE_WIDTH = 752;
 const int UEyeCamNodelet::DEFAULT_IMAGE_HEIGHT = 480;
-const string UEyeCamNodelet::DEFAULT_COLOR_MODE = "";
-const double UEyeCamNodelet::DEFAULT_EXPOSURE = 33.0;
-const double UEyeCamNodelet::DEFAULT_FRAME_RATE = 10.0;
+const string UEyeCamNodelet::DEFAULT_COLOR_MODE = " ";
+const double UEyeCamNodelet::DEFAULT_EXPOSURE = 3.0;
+const double UEyeCamNodelet::DEFAULT_FRAME_RATE = 30.0;
 const int UEyeCamNodelet::DEFAULT_PIXEL_CLOCK = 25;
 const int UEyeCamNodelet::DEFAULT_FLASH_DURATION = 1000;
 
@@ -93,13 +94,13 @@ UEyeCamNodelet::UEyeCamNodelet() :
   cam_params_.subsampling = cam_subsampling_rate_;
   cam_params_.binning = cam_binning_rate_;
   cam_params_.sensor_scaling = cam_sensor_scaling_rate_;
-  cam_params_.auto_gain = false;
+  cam_params_.auto_gain = true;
   cam_params_.master_gain = 0;
   cam_params_.red_gain = 0;
   cam_params_.green_gain = 0;
   cam_params_.blue_gain = 0;
   cam_params_.gain_boost = 0;
-  cam_params_.auto_exposure = false;
+  cam_params_.auto_exposure = true;
   cam_params_.exposure = DEFAULT_EXPOSURE;
   cam_params_.auto_white_balance = false;
   cam_params_.white_balance_red_offset = 0;
@@ -125,6 +126,273 @@ UEyeCamNodelet::~UEyeCamNodelet() {
   //}
 };
 
+void UEyeCamNodelet::initRectification(){
+    // intitialize rectification stuff
+    // my additions for rectivication
+    remapX = remapY = 0;
+    if(!ros::param::get("~calibFile", cfg_file))
+    {
+        cfg_file = "";
+        printf("No calib file -> not rectifying!\n");
+        doRect = false;
+    }
+    else
+    {
+        std::string rect;
+        doRect = true;
+    }
+
+
+    // prep rect
+    if(cfg_file != "")
+    {
+        // read parameters
+        std::ifstream infile(cfg_file.c_str());
+        std::string l1,l2,l3,l4;
+
+        std::getline(infile,l1);
+        std::getline(infile,l2);
+        std::getline(infile,l3);
+        std::getline(infile,l4);
+
+
+        // l1 & l2
+        if(std::sscanf(l1.c_str(), "%lf %lf %lf %lf %lf", &inputCalibration[0], &inputCalibration[1], &inputCalibration[2], &inputCalibration[3], &inputCalibration[4]) == 5 &&
+                std::sscanf(l2.c_str(), "%d %d", &in_width, &in_height) == 2)
+        {
+            printf("Input resolution: %d %d\n",in_width, in_height);
+            printf("In: %f %f %f %f %f\n",
+                    inputCalibration[0], inputCalibration[1], inputCalibration[2], inputCalibration[3], inputCalibration[4]);
+        }
+        else
+        {
+            printf("Failed to read camera calibration (invalid format?)\n");
+            doRect = false;
+        }
+
+        // l3
+        if(l3 == "crop")
+        {
+            outputCalibration[0] = -1;
+            printf("Out: Crop\n");
+        }
+        else if(l3 == "full")
+        {
+            outputCalibration[0] = -2;
+            printf("Out: Full\n");
+        }
+        else if(l3 == "none")
+        {
+            printf("NO RECTIFICATION\n");
+            doRect = false;
+        }
+        else if(std::sscanf(l3.c_str(), "%lf %lf %lf %lf %lf", &outputCalibration[0], &outputCalibration[1], &outputCalibration[2], &outputCalibration[3], &outputCalibration[4]) == 5)
+        {
+            printf("Out: %f %f %f %f %f\n",
+                    outputCalibration[0], outputCalibration[1], outputCalibration[2], outputCalibration[3], outputCalibration[4]);
+        }
+        else
+        {
+            printf("Out: Failed to Read Output pars... not rectifying.\n");
+            doRect = false;
+        }
+
+
+        // l4
+        if(std::sscanf(l4.c_str(), "%d %d", &out_width, &out_height) == 2)
+        {
+            printf("Output resolution: %d %d\n",out_width, out_height);
+        }
+        else
+        {
+            printf("Out: Failed to Read Output resolution... not rectifying.\n");
+            doRect = false;
+        }
+
+
+
+
+        // prep warp matrices
+        if(doRect)
+        {
+            ros_image_.data.resize(out_width*out_height);
+            ros_image_.step = out_width;
+            remapX = new float[out_width * out_height];
+            remapY = new float[out_width * out_height];
+
+            float dist = inputCalibration[4];
+            float d2t = 2.0f * tan(dist / 2.0f);
+
+            // current camera parameters
+            float fx = inputCalibration[0] * in_width;
+            float fy = inputCalibration[1] * in_height;
+            float cx = inputCalibration[2] * in_width - 0.5;
+            float cy = inputCalibration[3] * in_height - 0.5;
+
+            // output camera parameters
+            float ofx, ofy, ocx, ocy;
+
+            // find new camera matrix for "crop" and "full"
+            if(outputCalibration[0] == -1)	// "crop"
+            {
+                // find left-most and right-most radius
+                float left_radius = (cx)/fx;
+                float right_radius = (in_width-1 - cx)/fx; //DAVID: WHy is there a minus one here? left_radius+right_radius != width
+                float top_radius = (cy)/fy;
+                float bottom_radius = (in_height-1 - cy)/fy; //DAVID: Same question
+
+                float trans_left_radius = tan(left_radius * dist)/d2t;
+                float trans_right_radius = tan(right_radius * dist)/d2t;
+                float trans_top_radius = tan(top_radius * dist)/d2t;
+                float trans_bottom_radius = tan(bottom_radius * dist)/d2t;
+
+                printf("left_radius: %f -> %f\n", left_radius, trans_left_radius);
+                printf("right_radius: %f -> %f\n", right_radius, trans_right_radius);
+                printf("top_radius: %f -> %f\n", top_radius, trans_top_radius);
+                printf("bottom_radius: %f -> %f\n", bottom_radius, trans_bottom_radius);
+
+
+                ofy = fy * ((top_radius + bottom_radius) / (trans_top_radius + trans_bottom_radius)) * ((float)out_height / (float)in_height);
+                ocy = (trans_top_radius/top_radius) * ofy*cy/fy;
+
+                ofx = fx * ((left_radius + right_radius) / (trans_left_radius + trans_right_radius)) * ((float)out_width / (float)in_width);
+                ocx = (trans_left_radius/left_radius) * ofx*cx/fx;
+
+                printf("new K: %f %f %f %f\n",ofx,ofy,ocx,ocy);
+                printf("old K: %f %f %f %f\n",fx,fy,cx,cy);
+            }
+            else if(outputCalibration[0] == -2)	 // "full"
+            {
+                float left_radius = cx/fx;
+                float right_radius = (in_width-1 - cx)/fx;
+                float top_radius = cy/fy;
+                float bottom_radius = (in_height-1 - cy)/fy;
+
+                // find left-most and right-most radius
+                float tl_radius = sqrt(left_radius*left_radius + top_radius*top_radius);
+                float tr_radius = sqrt(right_radius*right_radius + top_radius*top_radius);
+                float bl_radius = sqrt(left_radius*left_radius + bottom_radius*bottom_radius);
+                float br_radius = sqrt(right_radius*right_radius + bottom_radius*bottom_radius);
+
+                float trans_tl_radius = tan(tl_radius * dist)/d2t;
+                float trans_tr_radius = tan(tr_radius * dist)/d2t;
+                float trans_bl_radius = tan(bl_radius * dist)/d2t;
+                float trans_br_radius = tan(br_radius * dist)/d2t;
+
+                //printf("trans_tl_radius: %f -> %f\n", tl_radius, trans_tl_radius);
+                //printf("trans_tr_radius: %f -> %f\n", tr_radius, trans_tr_radius);
+                //printf("trans_bl_radius: %f -> %f\n", bl_radius, trans_bl_radius);
+                //printf("trans_br_radius: %f -> %f\n", br_radius, trans_br_radius);
+
+
+                float hor = max(br_radius,tr_radius) + max(bl_radius,tl_radius);
+                float vert = max(tr_radius,tl_radius) + max(bl_radius,br_radius);
+
+                float trans_hor = max(trans_br_radius,trans_tr_radius) + max(trans_bl_radius,trans_tl_radius);
+                float trans_vert = max(trans_tr_radius,trans_tl_radius) + max(trans_bl_radius,trans_br_radius);
+
+                ofy = fy * ((vert) / (trans_vert)) * ((float)out_height / (float)in_height);
+                ocy = max(trans_tl_radius/tl_radius,trans_tr_radius/tr_radius) * ofy*cy/fy;
+
+                ofx = fx * ((hor) / (trans_hor)) * ((float)out_width / (float)in_width);
+                ocx = max(trans_bl_radius/bl_radius,trans_tl_radius/tl_radius) * ofx*cx/fx;
+
+                printf("new K: %f %f %f %f\n",ofx,ofy,ocx,ocy);
+                printf("old K: %f %f %f %f\n",fx,fy,cx,cy);
+            }
+            else
+            {
+                ofx = outputCalibration[0] * out_width;
+                ofy = outputCalibration[1] * out_height;
+                ocx = outputCalibration[2] * out_width-0.5;	// TODO: -0.5 here or not?
+                ocy = outputCalibration[3] * out_height-0.5;
+            }
+
+            outputCalibration[0] = ofx / out_width;
+            outputCalibration[1] = ofy / out_height;
+            outputCalibration[2] = (ocx+0.5) / out_width;
+            outputCalibration[3] = (ocy+0.5) / out_height;
+            outputCalibration[4] = 0;
+
+            for(int x=0;x<out_width;x++)
+                for(int y=0;y<out_height;y++)
+                {
+                    float ix = (x - ocx) / ofx;
+                    float iy = (y - ocy) / ofy;
+
+                    float r = sqrt(ix*ix + iy*iy);
+                    float fac = atan(r * d2t)/(dist*r);
+
+                    if(r==0) fac = 1;
+
+                    ix = fx*fac*ix+cx;
+                    iy = fy*fac*iy+cy;
+
+                    // make rounding resistant.
+                    if(ix == 0) ix = 0.01;
+                    if(iy == 0) iy = 0.01;
+                    if(ix == in_width-1) ix = in_width-1.01;
+                    if(iy == in_height-1) ix = in_height-1.01;
+
+                    if(ix > 0 && iy > 0 && ix < in_width-1 &&  iy < in_height-1)
+                    {
+                        remapX[x+y*out_width] = ix;
+                        remapY[x+y*out_width] = iy;
+                    }
+                    else
+                    {
+                        remapX[x+y*out_width] = -1;
+                        remapY[x+y*out_width] = -1;
+                    }
+                }
+            printf("Prepped Warp matrices\n");
+        }
+        else
+        {
+            printf("Not Rectifying\n");
+            outputCalibration[0] = inputCalibration[0];
+            outputCalibration[1] = inputCalibration[1];
+            outputCalibration[2] = inputCalibration[2];
+            outputCalibration[3] = inputCalibration[3];
+            outputCalibration[4] = inputCalibration[4];
+            out_width = in_width;
+            out_height = in_height;
+        }
+
+
+        for(int i=0;i<9;i++)
+            ros_cam_info_.K.at(i) = 0;
+
+        for(int i=0;i<12;i++)
+            ros_cam_info_.P.at(i) = 0;
+
+        ros_cam_info_.K.at(0) = outputCalibration[0] * out_width;
+        ros_cam_info_.K.at(4) = outputCalibration[1] * out_height;
+        ros_cam_info_.K.at(8) = 1;
+        ros_cam_info_.K.at(2) = outputCalibration[2] * out_width - 0.5;
+        ros_cam_info_.K.at(5) = outputCalibration[3] * out_height - 0.5;
+
+        ros_cam_info_.P.at(0) = outputCalibration[0] * out_width;
+        ros_cam_info_.P.at(5) = outputCalibration[1] * out_height;
+        ros_cam_info_.P.at(10) = 1;
+        ros_cam_info_.P.at(2) = outputCalibration[2] * out_width - 0.5;
+        ros_cam_info_.P.at(6) = outputCalibration[3] * out_height - 0.5;
+
+        ros_cam_info_.D.clear();
+        ros_cam_info_.D.push_back(outputCalibration[4]);
+        ros_cam_info_.D.push_back(0);
+        ros_cam_info_.D.push_back(0);
+        ros_cam_info_.D.push_back(0);
+        ros_cam_info_.D.push_back(0);
+
+
+        /*  Supported models are listed in sensor_msgs/distortion_models.h.
+            For most cameras, "plumb_bob" - a simple model of radial and
+            tangential distortion - is sufficent. */
+        ros_cam_info_.distortion_model = "plumb_bob";
+
+    }
+}
 
 void UEyeCamNodelet::onInit() {
   ros::NodeHandle& nh = getNodeHandle();
@@ -144,7 +412,7 @@ void UEyeCamNodelet::onInit() {
   }
 
   loadIntrinsicsFile();
-
+  initRectification();
   // Setup dynamic reconfigure server
   ros_cfg_ = new ReconfigureServer(ros_cfg_mutex_, local_nh);
   ReconfigureServer::CallbackType f;
@@ -816,6 +1084,11 @@ INT UEyeCamNodelet::queryCamParams() {
   ros_image_.step = cam_buffer_pitch_;
   ros_image_.is_bigendian = 0;
   ros_image_.data.resize(cam_buffer_size_);
+  NODELET_INFO_STREAM("Camera Params Width"<<cam_params_.image_width);
+  NODELET_INFO_STREAM("Camera Params Height"<<cam_params_.image_height);
+  NODELET_INFO_STREAM("Camera Buffer Pitch"<<cam_buffer_pitch_);
+
+
 
   return is_err;
 };
@@ -883,10 +1156,12 @@ void UEyeCamNodelet::frameGrabLoop() {
   int prevNumSubscribers = 0;
   int currNumSubscribers = 0;
   while (frame_grab_alive_ && ros::ok()) {
+
     // Initialize live video mode if camera was previously asleep, and ROS image topic has subscribers;
     // and stop live video mode if ROS image topic no longer has any subscribers
     currNumSubscribers = ros_cam_pub_.getNumSubscribers();
     if (currNumSubscribers > 0 && prevNumSubscribers <= 0) {
+      INFO_STREAM("New Subscriber detected");
       if (cam_params_.ext_trigger_mode) {
         if (setExtTriggerMode() != IS_SUCCESS) {
           NODELET_ERROR_STREAM("Shutting down UEye camera interface...");
@@ -967,13 +1242,64 @@ void UEyeCamNodelet::frameGrabLoop() {
 #endif
 
         if (!frame_grab_alive_ || !ros::ok()) break;
-        copy((char*) cam_buffer_,
-          ((char*) cam_buffer_) + cam_buffer_size_,
-          ros_image_.data.begin());
+
+        ////////////////
+        if(doRect)
+        {
+            // set height and width anew.
+            ros_cam_info_.height = out_height;
+            ros_cam_info_.width = out_width;
+            ros_image_.step = out_width;
+            ros_image_.width = out_width;
+            ros_image_.height = out_height;
+            int w = cam_buffer_pitch_;
+
+            for(int idx = out_width*out_height-1;idx>=0;idx--)
+            {
+                // get interp. values
+                float xx = remapX[idx];
+                float yy = remapY[idx];
+
+//                printf("xx: %f ",xx);
+//                printf("yy: %f \n",yy);
+
+                if(xx<0)
+                    ros_image_.data.at(idx) = 0;
+                else
+                {
+                    // get integer and rational parts
+                    int xxi = xx;
+                    int yyi = yy;
+                    xx -= xxi;
+                    yy -= yyi;
+                    float xxyy = xx*yy;
+
+
+                    // get array base pointer
+                    uchar* src = (uchar*)cam_buffer_ + xxi + yyi * w;
+
+                    // interpolate (bilinear)!
+                    ros_image_.data.at(idx) =  xxyy * src[1+w]
+                                                + (yy-xxyy) * src[w]
+                                                + (xx-xxyy) * src[1]
+                                                + (1-xx-yy+xxyy) * src[0];
+                }
+
+            }
+        }
+        else
+        {
+            ros_cam_info_.height = cam_params_.image_height;
+            ros_cam_info_.width = cam_params_.image_width;
+            copy((char*) cam_buffer_,
+              ((char*) cam_buffer_) + cam_buffer_size_,
+              ros_image_.data.begin());
+        }
+        ////////////////
+
         ros_image_.header.stamp = ros_cam_info_.header.stamp = ros::Time::now();
         ros_image_.header.seq = ros_cam_info_.header.seq = ros_frame_count_++;
-        ros_cam_info_.width = cam_params_.image_width;
-        ros_cam_info_.height = cam_params_.image_height;
+
         if (!frame_grab_alive_ || !ros::ok()) break;
         ros_cam_pub_.publish(ros_image_, ros_cam_info_);
       }
@@ -985,16 +1311,20 @@ void UEyeCamNodelet::frameGrabLoop() {
 
   setStandbyMode();
   frame_grab_alive_ = false;
+  INFO_STREAM("Frame Grabber Thread has stopped");
+
 };
 
 
 void UEyeCamNodelet::startFrameGrabber() {
+  INFO_STREAM("Starting Frame Grabber Thread");
   frame_grab_alive_ = true;
   frame_grab_thread_ = thread(bind(&UEyeCamNodelet::frameGrabLoop, this));
 };
 
 
 void UEyeCamNodelet::stopFrameGrabber() {
+  INFO_STREAM("Stopping Frame Grabber Thread");
   frame_grab_alive_ = false;
   if (frame_grab_thread_.joinable()) {
     frame_grab_thread_.join();

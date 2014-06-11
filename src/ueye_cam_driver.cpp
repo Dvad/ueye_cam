@@ -212,19 +212,19 @@ INT UEyeCamDriver::setColorMode(string mode, bool reallocate_buffer) {
       return is_err;
     }
     bits_per_pixel_ = 24;
-  } else if (mode == "bayer_rggb8") {
-    if ((is_err = is_SetColorMode(cam_handle_, IS_CM_SENSOR_RAW8)) != IS_SUCCESS) {
-      ERROR_STREAM("Could not set color mode to BAYER_RGGB8 (" << err2str(is_err) << ")");
-      return is_err;
+    } else if (mode == "bayer_rggb8") {
+      if ((is_err = is_SetColorMode(cam_handle_, IS_CM_SENSOR_RAW8)) != IS_SUCCESS) {
+       ERROR_STREAM("Could not set color mode to BAYER_RGGB8 (" << err2str(is_err) << ")");
+       return is_err;
+      }
+      bits_per_pixel_ = 8;
+    } else { // Default to MONO8
+      if ((is_err = is_SetColorMode(cam_handle_, IS_CM_MONO8)) != IS_SUCCESS) {
+        ERROR_STREAM("Could not set color mode to MONO8 (" << err2str(is_err) << ")");
+        return is_err;
+      }
+      bits_per_pixel_ = 8;
     }
-    bits_per_pixel_ = 8;
-  } else { // Default to MONO8
-    if ((is_err = is_SetColorMode(cam_handle_, IS_CM_MONO8)) != IS_SUCCESS) {
-      ERROR_STREAM("Could not set color mode to MONO8 (" << err2str(is_err) << ")");
-      return is_err;
-    }
-    bits_per_pixel_ = 8;
-  }
 
   DEBUG_STREAM("Updated color mode to " << mode);
 
@@ -727,15 +727,16 @@ INT UEyeCamDriver::setFlashParams(INT& delay_us, UINT& duration_us) {
 
 INT UEyeCamDriver::setFreeRunMode() {
   if (!isConnected()) return IS_INVALID_CAMERA_HANDLE;
+  INFO_STREAM("Trying to set Camera "<<cam_name_<<" set to free-run-mode");
 
   INT is_err = IS_SUCCESS;
 
   if (!freeRunModeActive()) {
     setStandbyMode(); // No need to check for success
-
     // Set the flash to a high active pulse for each image in the trigger mode
     INT flash_delay = 0;
     UINT flash_duration = 1000;
+    INFO_STREAM("Setting flash parameters");
     setFlashParams(flash_delay, flash_duration);
     UINT nMode = IO_FLASH_MODE_FREERUN_HI_ACTIVE;
     if ((is_err = is_IO(cam_handle_, IS_IO_CMD_FLASH_SET_MODE,
@@ -744,18 +745,47 @@ INT UEyeCamDriver::setFreeRunMode() {
           cam_name_ << "' (" << err2str(is_err) << ")");
       return is_err;
     }
+    INFO_STREAM("Trying to enable Event");
 
     if ((is_err = is_EnableEvent(cam_handle_, IS_SET_EVENT_FRAME)) != IS_SUCCESS) {
       ERROR_STREAM("Could not enable frame event for UEye camera '" <<
           cam_name_ << "' (" << err2str(is_err) << ")");
       return is_err;
     }
-    if ((is_err = is_CaptureVideo(cam_handle_, IS_WAIT)) != IS_SUCCESS) {
+    INFO_STREAM("Trying to Capture Video");
+
+    /*if ((is_err = is_CaptureVideo(cam_handle_, IS_WAIT)) != IS_SUCCESS) {
       ERROR_STREAM("Could not start free-run live video mode on UEye camera '" <<
           cam_name_ << "' (" << err2str(is_err) << ")");
       return is_err;
+    }*/
+    // There is a weird condition with the ueye 4.30 where
+    // this never returns when using IS_WAIT.
+    // We are using IS_DONT_WAIT and retry every 0.1s for 2s instead
+    // DAVID: From https://bitbucket.org/kmhallen/ueye/pull-request/2/fix-a-freeze-happening-on-a-second-call-to/diff
+    bool capture = false;
+    for (int i = 0; i < 20; ++i){
+        if ((is_err = is_CaptureVideo(cam_handle_, IS_DONT_WAIT)) == IS_SUCCESS){
+            capture = true;
+            break;
+        }
+        ros::Duration(0.1).sleep();
     }
+    if (!capture){
+        ERROR_STREAM("Could not start free-run live video mode on UEye camera '" <<
+            cam_name_ << "' (" << err2str(is_err) << ")");
+        ros::shutdown();
+    }
+    else{
+        ros::Duration(0.5).sleep();
+    }
+
+
+    INFO_STREAM("Started live video mode on UEye camera '" + cam_name_ + "'");
     DEBUG_STREAM("Started live video mode on UEye camera '" + cam_name_ + "'");
+  }
+  else{
+      INFO_STREAM("Camera "<<cam_name_<<" already set to free-run-mode");
   }
 
   return is_err;
@@ -764,7 +794,7 @@ INT UEyeCamDriver::setFreeRunMode() {
 
 INT UEyeCamDriver::setExtTriggerMode() {
   if (!isConnected()) return IS_INVALID_CAMERA_HANDLE;
-
+  INFO_STREAM("Camera "<<cam_name_<<" set to ExtTriggerMode");
   INT is_err = IS_SUCCESS;
 
   if (!extTriggerModeActive()) {
@@ -795,7 +825,7 @@ INT UEyeCamDriver::setExtTriggerMode() {
 
 INT UEyeCamDriver::setStandbyMode() {
   if (!isConnected()) return IS_INVALID_CAMERA_HANDLE;
-
+  INFO_STREAM("Camera "<<cam_name_<<" set to standby node");
   INT is_err = IS_SUCCESS;
 
   if (extTriggerModeActive()) {
